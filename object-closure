@@ -1,0 +1,154 @@
+#!/usr/bin/perl -l
+
+use strict;
+use warnings;
+
+BEGIN {
+    package Base;
+    $INC{'Base.pm'} = $0;
+
+    use Carp ();
+    use Clone ();
+
+    sub clone {
+        my ($old, $cbk) = @_;
+        $old->{clone} = $cbk;
+        my $new = Clone::clone $old;
+        $new->{clone}->($new);
+        delete $old->{clone};
+        delete $new->{clone};
+        return $new;
+    }
+
+    our $AUTOLOAD;
+
+    sub AUTOLOAD {
+        $AUTOLOAD =~ s/.*:://;
+        my $meth = $_[0]->can($AUTOLOAD)
+            or Carp::croak qq{Can't locate method "$AUTOLOAD" for $_[0]};
+        goto &$meth;
+    }
+
+    sub can {
+        my ($self, $meth) = @_;
+        return $self->{$meth};
+    }
+
+    sub DOES {
+        my ($self, $role) = @_;
+        my $does = $self->{DOES}{$role};
+        if (ref $does) {
+            my $meths = $self->$does;
+            if ($meths) {
+                for (keys %$meths) {
+                    $self->{$_} = $meths->{$_};
+                }
+                $role->apply($self);
+            }
+            $does = 1;
+        }
+        return $does;
+    }
+
+}
+
+BEGIN {
+    package Foo;
+    use base qw/Base/;
+
+    sub new {
+        my ($class) = @_;
+        my $i = 0;
+        return bless {
+            foo => sub { print $i++ },
+            double => sub { return $_[0]->clone(sub { $i *= 2 }); },
+        }, $class;
+    }
+}
+
+BEGIN {
+    package Role;
+    $INC{'Role.pm'} = $0;
+
+    use Carp ();
+
+    sub import {
+        my $pkg = caller;
+        my (@uses, @reqd, %dflt);
+        my %exports = (
+            requires => sub { push @reqd, @_; },
+            default  => sub { $dflt{$_[0]} = $_[1]; },
+            with     => sub { push @uses, @_; },
+            apply    => sub {
+                my ($self, $to) = @_;
+                for (@uses) {
+                    $_->apply($to);
+                }
+                for (@reqd) {
+                    $to->{$_} or Carp::croak qq{$self requires method "$_"};
+                }
+                for (keys %dflt) {
+                    $to->{$_} ||= $dflt{$_};
+                }
+                $to->{DOES}{$self} = 1;
+            },
+            DOES     => sub { ! ! grep { $_ eq $_[1] } __PACKAGE__, @uses },
+        );
+        {
+            no strict 'refs';
+            @{"$pkg\::ISA"} = __PACKAGE__;
+            for (keys %exports) {
+                *{"$pkg\::$_"} = $exports{$_};
+            }
+        }
+    }
+}
+
+BEGIN {
+    package Bar;
+
+    use Role;
+
+    requires 'foo';
+    default bar => sub { print "bar"; };
+}
+
+BEGIN {
+    package Baz;
+
+    use base qw/Base/;
+
+    sub new {
+        my $class = shift;
+        return bless {
+            foo  => sub { print "FOO"; },
+            baz  => sub { print "baz"; },
+            DOES => {
+                Bar => sub {
+                    return {
+                        bar => sub { print "BAR"; },
+                    };
+                },
+            },
+        }, $class;
+    }
+}
+        
+my $x = Foo->new;
+$x->foo;
+print "x can"  . ($x->can('bar')  ? '' : "'t" ) . " bar";
+print "x DOES" . ($x->DOES('Bar') ? '' : "N'T") . " Bar";
+print "x can"  . ($x->can('bar')  ? '' : "'t" ) . " bar";
+
+$x->foo;
+my $y = $x->double;
+$y->foo;
+$x->foo;
+$y->foo;
+$x->foo;
+
+$x = Baz->new;
+print "x can"  . ($x->can('bar')  ? '' : "'t" ) . " bar";
+print "x DOES" . ($x->DOES('Bar') ? '' : "N'T") . " Bar";
+print "x can"  . ($x->can('bar')  ? '' : "'t" ) . " bar";
+$x->bar;
