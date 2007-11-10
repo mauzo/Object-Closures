@@ -15,6 +15,40 @@ $VERSION = eval $VERSION;
 
 our $AUTOLOAD;
 
+use strict ();
+use warnings ();
+use Clone::Closure ();
+
+sub import {
+    my $pkg = caller;
+    push @{"$pkg\::ISA"}, __PACKAGE__;
+    strict->import;
+    warnings->import;
+    goto &Object::Closures::Util::import;
+}
+
+# we must create stubs here, as AUTOLOAD is here and doesn't (or
+# shouldn't) inherit past a stub. They don't cause problems, as anything
+# we inherit doesn't get stubbed.
+sub can {
+    my ($self, $meth) = @_;
+    my $code = $self->UNIVERSAL::can($meth);
+    $code and return $code;
+    ref $self or return;
+    exists $self->{$meth} and return \&$meth;
+}
+
+sub clone {
+    my ($old, $cbk) = @_;
+
+    # we must clone both in one operation
+    my $new = Clone::Closure::clone [$old, $cbk];
+    ($new, $cbk) = @$new;
+
+    $cbk and $cbk->($new);
+    return $new;
+}
+
 # we use another package so as not to create any false methods
 
 package Object::Closures::Util;
@@ -22,112 +56,151 @@ package Object::Closures::Util;
 use strict;
 use warnings;
 
-use Carp            qw/croak/;
-use Clone::Closure  qw/clone/;
-use Scalar::Util    qw/reftype blessed/;
+use Carp                    qw/croak/;
+use Clone::Closure          ();
+use Scalar::Util            qw/reftype blessed/;
+use Hash::Util::FieldHash   qw/fieldhash/;
+use Symbol                  qw/gensym/;
+
+my @KEYWORDS;
+
+sub import {
+    my $to = caller;
+
+    no strict 'refs';
+    *{"$to\::$_"} = \&$_ for @KEYWORDS;
+}
+
+sub unimport {
+    my $from = caller;
+
+    for (@KEYWORDS) {
+        no strict 'refs';
+        no warnings 'misc';
+
+        my $old = "$from\::$_";
+
+        if (*$old{CODE} == \&$_) {
+            # we have to copy each piece individually
+            my $new = gensym;
+            *$new = *$old{SCALAR};
+            *$new = *$old{ARRAY};
+            *$new = *$old{HASH};
+            *$new = *$old{IO};
+            *$new = *$old{FORMAT};
+            delete ${"$from\::"}{$_};
+            *$old = $new;
+        }
+    }
+}
+
+push @KEYWORDS, qw/inherit self super/;
+
+# XXX now called from build: needs to call parent's build and set
+# self->{isa}
+sub inherit {
+    my $caller = caller;
+    no strict 'refs';
+    push @{"$caller\::ISA"}, @_;
+}
+
+our $SELF;
+sub self { $SELF }
 
 # our means that we get the correct $AUTOLOAD
-
 sub Object::Closures::AUTOLOAD {
     $AUTOLOAD =~ s/.*:://;
-    my $meth = $_[0]->can($AUTOLOAD)
-        or croak qq{Can't locate method "$AUTOLOAD" for $_[0]};
-    goto &$meth;
+    local $SELF = $_[0];
+    # can't goto & or we lose the local
+    &do_auto;
 }
 
-sub Object::Closures::DESTROY {
-    my $d = $_[0]->{DESTROY};
-    $d and $_[0]->$d;
+sub do_auto {
+    my $table = shift;
+    my $entry = $table->{$AUTOLOAD};
+
+    unless (defined $entry) {
+        my $type = \$table == \$SELF ? 'method' : 'key';
+        croak "No such $type '$AUTOLOAD'";
+    }
+
+    blessed $entry and return $entry->$AUTOLOAD(@_);
+
+    for (reftype $entry) {
+        #warn "# got a $_ entry for $AUTOLOAD";
+        defined or last;
+        /CODE/              and goto &$entry;
+        /SCALAR/ || /REF/   and return $$entry;
+        /ARRAY/             and do {
+            defined wantarray or return;
+            return wantarray ? @{$entry}[1..$#$entry] : ${$entry}[0];
+        };
+        /HASH/              and do {
+            @_ or croak "Missing argument for '$AUTOLOAD'";
+            $AUTOLOAD = splice @_, 0, 1, $entry;
+            goto &do_auto;
+        };
+
+    }
+    return $entry;
 }
+
+my (%BUILD, %DEMOLISH);
+
+push @KEYWORDS, qw/build clone demolish/;
 
 sub Object::Closures::new {
     my $class = shift;
-    return bless { @_ }, $class;
+    local $SELF = bless {}, $class;
+    $BUILD{$class}(@_);
+    return self;
 }
 
-sub Object::Closures::clone {
-    my ($old, $cbk) = @_;
-
-    # we must clone both in one operation
-    my $new = clone [$old, $cbk];
-    ($new, $cbk) = @$new;
-
-    $cbk and $cbk->($new);
-    return $new;
+sub build (&) {
+    my ($build) = @_;
+    my $class   = caller;
+    $BUILD{$class} = $build;
+    goto &unimport;
 }
 
-sub do_can;
-sub do_can {
-    my ($table, $meth) = @_;
-    my $entry = $table->{$meth};
+sub clone { self->clone(@_) }
 
-    $entry or return;
-    blessed $entry and return sub { $entry->$meth(@_) };
+my @EDITS = qw(method default replace override);
+push @KEYWORDS, @EDITS;
 
-    for (reftype $entry) {
-        defined or last;
-        /CODE/              and return $entry;
-        /SCALAR/ || /REF/   and return sub { $$entry };
-        /ARRAY/             and return sub {
-            defined wantarray or return;
-            my @list   = @$entry;
-            my $scalar = shift @list;
-            return wantarray ? @list : $scalar;
-        };
-        /HASH/              and return sub {
-            @_ >= 2 or croak "Missing argument to '$meth'";
-            my $self = shift;
-            my $key  = shift;
-            do_can($entry, $key)->($self, @_);
-        };
-    }
-    return sub { $entry };
-};
+for my $sub (@EDITS) {
+    no strict 'refs';
+    *$sub = sub {
+        my $entry = pop;
+        my $name  = pop;
+        my $table = self 
+            or croak "No object to apply '$sub' to";
 
-sub Object::Closures::can {
-    my ($self, $meth) = @_;
-    my $code = $self->UNIVERSAL::can($meth);
-    $code and return $code;
-    goto &do_can;
-}
+        for (@_) {
+            unless (exists $table->{$_}) {
+                $sub eq 'replace' and croak "Key '$_' doesn't exist";
+                $table->{$_} = {};
+            }
 
-sub do_methods;
-sub do_methods {
-    my ($old, $table) = @_;
+            $table = $table->{$_};
 
-    for (keys %$table) {
-        my ($t, $m) = /^(\W?)(\w+)$/
-            or croak "invalid method name '$_'";
-        my $new = $table->{$_};
-
-        ref $new and ref $old->{$m}
-            and reftype $new eq 'HASH'
-            and reftype $old->{$m} eq 'HASH'
-            and do {
-                do_methods $old->{$m}, $new;
-                next;
-            };
-
-        if (!defined $t or $t eq '') {
-            exists $old->{$m}
-                and croak "Method '$m' already exists";
-            $old->{$m} = $new;
+            reftype $table eq 'HASH'
+                or croak "Not a HASH reference";
         }
-        elsif ($t eq '+') {
-            $old->{$m} ||= $new;
-        }
-        elsif ($t eq '-') {
-            $old->{$m} &&= $new;
-        }
-        else {
-            croak "invalid method name '$_'";
-        }
-    }
-};
 
-sub Object::Closures::_methods {
-    my ($self, %meths) = @_;
-    do_methods $self, \%meths;
+        {
+            $sub eq 'override' and last;
+            my $ex = exists $table->{$name};
+            #warn "# $name does " . ($ex ? '' : 'not ') . "exist";
+            $sub eq 'replace' and $ex = !$ex;
+            $ex or last;
+
+            $sub eq 'method' and croak "Method '$name' already exists";
+            return;
+        }
+
+        $table->{$name} = $entry;
+    };
 }
 
 1;

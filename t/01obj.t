@@ -10,26 +10,45 @@ use Object::Closures;
 BEGIN {
     package t::Object;
 
-    our @ISA = qw/Object::Closures/;
+    use Object::Closures;
 
-    sub new {
-        my ($class, $name) = @_;
-        return $class->SUPER::new(
+    BEGIN { our @method = "xxx" }
+
+    inherit 'Object::Closures';
+
+    build {
+        my ($name) = @_;
+
+        method scal => $name;
+        method list => [$name, $name, "foo-$name"];
+        method ref  => \$name;
+        method code => sub { $name . $_[0] };
+        method hash => {
             scal => $name,
-            list => [$name, $name, "foo-$name"],
-            ref  => \$name,
-            code => sub { $name . $_[1] },
-            hash => {
-                scal => $name,
-                code => sub { $name . $_[1] },
-            },
-        );
-    }
+            code => sub { $name . $_[0] },
+        };
+        method self => sub { self };
+
+        method allchange => sub {
+            method  foo  => 'bar';
+            default code => 'code';
+            default plus => 'plus';
+            replace scal => 'scal';
+            replace none => 'none';
+            method  hash => baz => 'quux';
+        };
+            
+    };
 }
 
 my $tests;
 
 my $obj = t::Object->new('foo');
+
+BEGIN { $tests += 2 }
+
+ok      !defined &t::Object::method,        'keywords removed';
+is      $t::Object::method[0],  'xxx',      '...leaving other types';
 
 BEGIN { $tests += 6 }
 
@@ -40,7 +59,7 @@ can_ok  $obj,       'clone';
 ok      $obj->isa('t::Object'),             '...and ->isa works';
 ok      $obj->isa('Object::Closures'),      '...correctly';
 
-BEGIN { $tests += 7 }
+BEGIN { $tests += 8 }
 
 is      $obj->scal,             'foo',          'scalar meth';
 is      $obj->list,             'foo',          'array meth, scalar ctx';
@@ -49,42 +68,35 @@ is      $obj->ref,              'foo',          'ref meth';
 is      $obj->code('bar'),      'foobar',       'code meth';
 is      $obj->hash('scal'),     'foo',          'hash/scalar meth';
 is      $obj->hash(code => 'bar'),  'foobar',   'hash/code meth';
+is      $obj->self,             $obj,           'self';
 
-$obj->_methods(
-    foo     => 'bar',
-    '+code' => 'code',
-    '+plus'  => 'plus',
-    -scal   => 'scal',
-    -none   => 'none',
-    hash    => {
-        baz => 'quux',
-    },
-);
+$obj->allchange;
 
 BEGIN { $tests += 9 }
 
 ok      $obj->can('foo'),                       'added method';
 is      eval {$obj->foo },      'bar',          '...correctly';
-ok      $obj->can('plus'),                      'added +method';
+ok      $obj->can('plus'),                      'default applied';
 is      eval { $obj->plus },    'plus',         '...correctly';
-is      $obj->code(''),         'foo',          'ignored +method';
-is      $obj->scal,             'scal',         'replaced -method';
-ok      !$obj->can('none'),                     'ignored -method';
+is      $obj->code(''),         'foo',          'default ignored';
+is      $obj->scal,             'scal',         'replaced method';
+ok      !$obj->can('none'),                     'replacement ignored';
 is      $obj->hash('scal'),     'foo',          'hash meth still there';
 is      $obj->hash('baz'),      'quux',         'new hash meth';
 
 BEGIN {
     package t::Number;
 
-    our @ISA = qw/Object::Closures/;
+    use Object::Closures;
 
-    sub new {
-        my ($class, $num) = @_;
-        return $class->SUPER::new(
-            value => sub { $num },
-            inc   => sub { $_[0]->clone(sub { $num++ }) },
-        );
-    }
+    inherit 'Object::Closures';
+
+    build {
+        my ($num) = @_;
+
+        method value => sub { $num };
+        method inc   => sub { self->clone(sub { $num++ }) };
+    };
 }
 
 my $num = t::Number->new(4);
@@ -93,8 +105,8 @@ my $inc = $num->inc;
 BEGIN { $tests += 3 }
 
 isnt    $inc,               $num,       'cloned, not copied';
-is      $inc->value,        5,          'new value changed';
 is      $num->value,        4,          'old value kept';
+is      $inc->value,        5,          'new value changed';
 
 
 BEGIN { plan tests => $tests }
