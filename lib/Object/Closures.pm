@@ -29,7 +29,7 @@ sub import {
 
 # we must create stubs here, as AUTOLOAD is here and doesn't (or
 # shouldn't) inherit past a stub. They don't cause problems, as anything
-# we inherit doesn't get stubbed.
+# we inherit or implement doesn't get stubbed.
 sub can {
     my ($self, $meth) = @_;
     my $code = $self->UNIVERSAL::can($meth);
@@ -94,62 +94,85 @@ sub unimport {
     }
 }
 
-push @KEYWORDS, qw/inherit self super/;
-
-# XXX now called from build: needs to call parent's build and set
-# self->{isa}
-sub inherit {
-    my $caller = caller;
-    no strict 'refs';
-    push @{"$caller\::ISA"}, @_;
-}
+push @KEYWORDS, qw/inherit with self/;
 
 our $SELF;
 sub self { $SELF }
 
-# our means that we get the correct $AUTOLOAD
-sub Object::Closures::AUTOLOAD {
-    $AUTOLOAD =~ s/.*:://;
-    local $SELF = $_[0];
-    # can't goto & or we lose the local
-    &do_auto;
+sub inherit {
+    my $from = shift;
+
+    $COMPOSE{$from}
+        and croak "$from is a role, use 'with' instead of 'inherit'"
+
+    method isa => $from => 1;
+    $BUILD{$from} and $BUILD{$from}->(@_);
 }
 
-sub do_auto {
-    my $table = shift;
-    my $entry = $table->{$AUTOLOAD};
+sub with {
+    my ($role) = @_;
+    replace DOES => $role => 1;
+    $COMPOSE{$role} and $COMPOSE{$role}->(@_);
+}
 
-    unless (defined $entry) {
-        my $type = \$table == \$SELF ? 'method' : 'key';
-        croak "No such $type '$AUTOLOAD'";
-    }
+sub invoke {
+    my ($name, $entry, $args) = @_;
 
-    blessed $entry and return $entry->$AUTOLOAD(@_);
+    blessed $entry and return $entry->$name(@$args);
 
     for (reftype $entry) {
-        #warn "# got a $_ entry for $AUTOLOAD";
+        #warn "# got a $_ entry for $name";
         defined or last;
-        /CODE/              and goto &$entry;
+        /CODE/              and do {
+            @_ = @$args;
+            goto &$entry;
+        };
         /SCALAR/ || /REF/   and return $$entry;
         /ARRAY/             and do {
-            defined wantarray or return;
-            return wantarray ? @{$entry}[1..$#$entry] : ${$entry}[0];
+            my ($before, $meth, $after) = @$entry;
+            my ($rv, @rv);
+
+            $_->(@$args) for @$before;
+
+            wantarray
+                ? @rv = invoke $name, $meth, $args
+                : defined wantarray
+                    ? $rv = invoke $name, $meth, $args
+                    : invoke $name, $meth, $args;
+            
+            $_->(@$args) for @$after;
+
+            return wantarray
+                ? @rv : defined wantarray
+                    ? $rv : ();
         };
         /HASH/              and do {
-            @_ or croak "Missing argument for '$AUTOLOAD'";
-            $AUTOLOAD = splice @_, 0, 1, $entry;
-            goto &do_auto;
+            @$args or croak "Missing argument for '$name'";
+            my $key  = shift @$args;
+            my $meth = $entry->{$key} or return;
+            @_ = ($key, $meth, $args);
+            goto &invoke;
         };
 
     }
     return $entry;
 }
 
-my (%BUILD, %DEMOLISH);
+# our means that we get the correct $AUTOLOAD
+sub Object::Closures::AUTOLOAD {
+    $AUTOLOAD =~ s/.*:://;
+    local $SELF = shift;
+    exists $SELF->{$AUTOLOAD}
+        or croak "No such method '$AUTOLOAD'";
+    invoke $AUTOLOAD, $SELF->{$AUTOLOAD}, \@_;
+}
 
-push @KEYWORDS, qw/build clone demolish/;
+my (%BUILD, %COMPOSE);
 
-sub Object::Closures::new {
+push @KEYWORDS, qw/build construct compose clone/;
+
+# XXX
+sub construct {
     my $class = shift;
     local $SELF = bless {}, $class;
     $BUILD{$class}(@_);
@@ -157,46 +180,96 @@ sub Object::Closures::new {
 }
 
 sub build (&) {
-    my ($build) = @_;
-    my $class   = caller;
-    $BUILD{$class} = $build;
+    my $class = caller;
+
+    $COMPOSE{$class}
+        and croak "$class is already defined as a role";
+    $BUILD{$class} = shift;
+
+    goto &unimport;
+}
+
+sub compose (&) {
+    my $role = caller;
+
+    $BUILD{$role}
+        and croak "$role is already defined as a class";
+    $COMPOSE{$role} = shift;
+
     goto &unimport;
 }
 
 sub clone { self->clone(@_) }
 
-my @EDITS = qw(method default replace override);
+push @KEYWORDS, qw/super/;
+
+our $SUPER;
+sub super { $SUPER->(@_) }
+
+my @EDITS = qw/method replace default before after around/;
 push @KEYWORDS, @EDITS;
+
+sub parse_change {
+    my $create = shift;
+    my $entry  = pop;
+    my $name   = pop;
+    my $method;
+    my $table  = self
+        or croak "No object in scope";
+
+    for (@_) {
+        unless (exists $table->{$_}) {
+            $create or croak $method
+                ? "Method '$method' does not have key '$_'"
+                : "Method '$_' is not defined";
+
+            $table->{$_} = {};
+        }
+
+        $table = $table->{$_};
+
+        reftype $table eq 'HASH'
+            or croak "Not a HASH reference";
+
+        $method ||= $_;
+    }
+
+    my $ex = exists $table->{$name};
+}    
 
 for my $sub (@EDITS) {
     no strict 'refs';
     *$sub = sub {
+        use strict 'refs';
+
         my $entry = pop;
         my $name  = pop;
         my $table = self 
             or croak "No object to apply '$sub' to";
 
-        for (@_) {
-            unless (exists $table->{$_}) {
-                $sub eq 'replace' and croak "Key '$_' doesn't exist";
-                $table->{$_} = {};
+        my $want = 
+            $sub eq 'around' || 
+            $sub eq 'before' || 
+            $sub eq 'after';
+
+        $sub eq 'method' and $ex
+            and croak "Method '$name' already exists";
+
+        $sub eq 'default' and $ex and return;
+
+        if ($want) {
+            $ex or croak "Method '$name' not defined";
+            my $new = $entry;
+            my $old = $table->{$name};
+            
+            if ($sub eq 'around') {
+                $entry  = sub {
+                    local $SUPER = $old;
+                    invoke $name, $new, \@_;
+                };
             }
-
-            $table = $table->{$_};
-
-            reftype $table eq 'HASH'
-                or croak "Not a HASH reference";
-        }
-
-        {
-            $sub eq 'override' and last;
-            my $ex = exists $table->{$name};
-            #warn "# $name does " . ($ex ? '' : 'not ') . "exist";
-            $sub eq 'replace' and $ex = !$ex;
-            $ex or last;
-
-            $sub eq 'method' and croak "Method '$name' already exists";
-            return;
+            else {
+                $entry = [[], 
         }
 
         $table->{$name} = $entry;
