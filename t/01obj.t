@@ -5,7 +5,6 @@ use warnings;
 
 use Test::More;
 use Object::Closures;
-#use Data::Dump          qw/dump/;
 
 BEGIN {
     package t::Object;
@@ -14,13 +13,14 @@ BEGIN {
 
     BEGIN { our @method = "xxx" }
 
-    inherit 'Object::Closures';
+    sub new { construct(@_) }
 
     build {
         my ($name) = @_;
 
+        inherit 'Object::Closures';
+
         method scal => $name;
-        method list => [$name, $name, "foo-$name"];
         method ref  => \$name;
         method code => sub { $name . $_[0] };
         method hash => {
@@ -59,17 +59,16 @@ can_ok  $obj,       'clone';
 ok      $obj->isa('t::Object'),             '...and ->isa works';
 ok      $obj->isa('Object::Closures'),      '...correctly';
 
-BEGIN { $tests += 8 }
+BEGIN { $tests += 6 }
 
 is      $obj->scal,             'foo',          'scalar meth';
-is      $obj->list,             'foo',          'array meth, scalar ctx';
-is      +($obj->list)[1],       'foo-foo',      'array meth, list ctx';
 is      $obj->ref,              'foo',          'ref meth';
 is      $obj->code('bar'),      'foobar',       'code meth';
 is      $obj->hash('scal'),     'foo',          'hash/scalar meth';
 is      $obj->hash(code => 'bar'),  'foobar',   'hash/code meth';
 is      $obj->self,             $obj,           'self';
 
+diag 'all change';
 $obj->allchange;
 
 BEGIN { $tests += 9 }
@@ -89,10 +88,12 @@ BEGIN {
 
     use Object::Closures;
 
-    inherit 'Object::Closures';
+    sub new { construct(@_) }
 
     build {
         my ($num) = @_;
+
+        inherit 'Object::Closures';
 
         method value => sub { $num };
         method inc   => sub { self->clone(sub { $num++ }) };

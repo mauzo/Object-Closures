@@ -38,6 +38,11 @@ sub can {
     exists $self->{$meth} and return \&$meth;
 }
 
+# we must stub everything UNIVERSAL implements, or it won't be
+# autoloaded.
+sub isa;
+sub DOES;
+
 sub clone {
     my ($old, $cbk) = @_;
 
@@ -94,34 +99,21 @@ sub unimport {
     }
 }
 
-push @KEYWORDS, qw/inherit with self/;
+push @KEYWORDS, qw/self super/;
 
 our $SELF;
 sub self { $SELF }
 
-sub inherit {
-    my $from = shift;
+our $SUPER;
+sub super { $SUPER->(@_) }
 
-    $COMPOSE{$from}
-        and croak "$from is a role, use 'with' instead of 'inherit'"
-
-    method isa => $from => 1;
-    $BUILD{$from} and $BUILD{$from}->(@_);
-}
-
-sub with {
-    my ($role) = @_;
-    replace DOES => $role => 1;
-    $COMPOSE{$role} and $COMPOSE{$role}->(@_);
-}
-
+sub invoke;
 sub invoke {
     my ($name, $entry, $args) = @_;
 
     blessed $entry and return $entry->$name(@$args);
 
     for (reftype $entry) {
-        #warn "# got a $_ entry for $name";
         defined or last;
         /CODE/              and do {
             @_ = @$args;
@@ -169,12 +161,16 @@ sub Object::Closures::AUTOLOAD {
 
 my (%BUILD, %COMPOSE);
 
-push @KEYWORDS, qw/build construct compose clone/;
+push @KEYWORDS, qw/build construct compose inherit with clone/;
+
+use subs qw/method replace/;
 
 # XXX
 sub construct {
     my $class = shift;
-    local $SELF = bless {}, $class;
+    local $SELF = bless {}, 'Object::Closures';
+    method isa => $class => 1;
+    method DOES => $class => 1;
     $BUILD{$class}(@_);
     return self;
 }
@@ -199,43 +195,26 @@ sub compose (&) {
     goto &unimport;
 }
 
+sub inherit {
+    my $from = shift;
+
+    $COMPOSE{$from}
+        and croak "$from is a role, use 'with' instead of 'inherit'";
+
+    method isa => $from => 1;
+    $BUILD{$from} and $BUILD{$from}->(@_);
+}
+
+sub with {
+    my ($role) = @_;
+    replace DOES => $role => 1;
+    $COMPOSE{$role} and $COMPOSE{$role}->(@_);
+}
+
 sub clone { self->clone(@_) }
-
-push @KEYWORDS, qw/super/;
-
-our $SUPER;
-sub super { $SUPER->(@_) }
 
 my @EDITS = qw/method replace default before after around/;
 push @KEYWORDS, @EDITS;
-
-sub parse_change {
-    my $create = shift;
-    my $entry  = pop;
-    my $name   = pop;
-    my $method;
-    my $table  = self
-        or croak "No object in scope";
-
-    for (@_) {
-        unless (exists $table->{$_}) {
-            $create or croak $method
-                ? "Method '$method' does not have key '$_'"
-                : "Method '$_' is not defined";
-
-            $table->{$_} = {};
-        }
-
-        $table = $table->{$_};
-
-        reftype $table eq 'HASH'
-            or croak "Not a HASH reference";
-
-        $method ||= $_;
-    }
-
-    my $ex = exists $table->{$name};
-}    
 
 for my $sub (@EDITS) {
     no strict 'refs';
@@ -243,9 +222,34 @@ for my $sub (@EDITS) {
         use strict 'refs';
 
         my $entry = pop;
-        my $name  = pop;
         my $table = self 
             or croak "No object to apply '$sub' to";
+        my $method;
+
+        my $name  = pop;
+
+        my $create = 
+            $sub eq 'method' ||
+            $sub eq 'default';
+
+        for (@_) {
+            unless (exists $table->{$_}) {
+                $create or croak $method
+                    ? "Method '$method' does not have key '$_'"
+                    : "Method '$_' is not defined";
+
+                $table->{$_} = {};
+            }
+
+            $table = $table->{$_};
+
+            reftype $table eq 'HASH'
+                or croak "Not a HASH reference";
+
+            $method ||= $_;
+        }
+
+        my $ex = exists $table->{$name};
 
         my $want = 
             $sub eq 'around' || 
@@ -253,12 +257,17 @@ for my $sub (@EDITS) {
             $sub eq 'after';
 
         $sub eq 'method' and $ex
-            and croak "Method '$name' already exists";
+            and croak $method
+                ? "Method '$method' already has a key '$name'"
+                : "Method '$name' already exists";
 
         $sub eq 'default' and $ex and return;
+        $sub eq 'replace' and ($ex or return);
 
         if ($want) {
-            $ex or croak "Method '$name' not defined";
+            $ex or croak $method
+                ? "Method '$method' has no key '$name'"
+                : "Method '$name' not defined";
             my $new = $entry;
             my $old = $table->{$name};
             
@@ -269,7 +278,19 @@ for my $sub (@EDITS) {
                 };
             }
             else {
-                $entry = [[], 
+                ref $old eq 'ARRAY' 
+                    or $old = [[], $old, []];
+
+                if ($sub eq 'before') {
+                    push @{$old->[0]}, $new;
+                }
+                elsif ($sub eq 'after') {
+                    unshift @{$old->[2]}, $new;
+                }
+                else { die "can't happen" }
+
+                $entry = $old;
+            }
         }
 
         $table->{$name} = $entry;
