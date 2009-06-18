@@ -10,70 +10,105 @@ Object::Closures - Classless objects built out of closures
 
 =cut
 
-our $VERSION = '0.00';
-$VERSION = eval $VERSION;
-
-our $AUTOLOAD;
-
-use strict ();
-use warnings ();
-use Clone::Closure ();
-
-sub import {
-    my $pkg = caller;
-    push @{"$pkg\::ISA"}, __PACKAGE__;
-    strict->import;
-    warnings->import;
-    goto &Object::Closures::Util::import;
-}
-
-# we must create stubs here, as AUTOLOAD is here and doesn't (or
-# shouldn't) inherit past a stub. They don't cause problems, as anything
-# we inherit or implement doesn't get stubbed.
-sub can {
-    my ($self, $meth) = @_;
-    my $code = $self->UNIVERSAL::can($meth);
-    $code and return $code;
-    ref $self or return;
-    exists $self->{$meth} and return \&$meth;
-}
-
-# we must stub everything UNIVERSAL implements, or it won't be
-# autoloaded.
-sub isa;
-sub DOES;
-
-sub clone {
-    my ($old, $cbk) = @_;
-
-    # we must clone both in one operation
-    my $new = Clone::Closure::clone [$old, $cbk];
-    ($new, $cbk) = @$new;
-
-    $cbk and $cbk->($new);
-    return $new;
-}
-
-# we use another package so as not to create any false methods
-
-package Object::Closures::Util;
+use version; our $VERSION = '0.00';
 
 use strict;
 use warnings;
 
-use Carp                    qw/croak/;
-use Clone::Closure          ();
+use Carp                    qw/carp croak/;
 use Scalar::Util            qw/reftype blessed/;
-use Hash::Util::FieldHash   qw/fieldhash/;
 use Symbol                  qw/gensym/;
+use Sub::Name               qw/subname/;
+use Sub::Identify           qw/stash_name/;
+use Data::Dump              qw/dump/;
 
-my @KEYWORDS;
+our (%BUILD, %COMPOSE, %CLASS);
+our ($SELF, @SUPER);
+my  @KEYWORDS;
+
+# MAGIC PACKAGES
+#
+# THESE ARE NOT CLASSES. They are magic strings that SVs can be blessed
+# into to signify certain properties.
+#
+# ::default             may be replaced by method
+# ::ambiguous           ambiguous defaults: croak when built
+# ::mro                 a list of supermethods
+# ::delegate            a ref to an object
+
+{
+    my $MG = __PACKAGE__ . "::";
+    no warnings "uninitialized";
+
+    sub _mg  { $MG . $_[0] }
+
+    sub ismg { 
+        my $pkg = blessed $_[0];
+        @_ == 1 
+            ? $pkg =~ /^\Q$MG/ 
+            : grep $pkg eq $_, map _mg($_), @_;
+    }
+
+    sub mkmg {
+        my $o   = $_[0];
+        my $pkg = _mg $_[1];
+        ismg $o and croak "tried to mkmg an ismg";
+        ref $o or $o = \do{ my $tmp = $o };
+        bless $o, $pkg;
+    }
+}
+
+sub _ctx {
+    my $sub = shift;
+    my $ctx = (caller 1)[5];
+    return $ctx
+        ? $sub->(@_)
+        : defined $ctx
+            ? scalar $sub->(@_)
+            : do { $sub->(@_); () };
+}
+
+sub invoke;
 
 sub import {
-    my $to = caller;
+    my $pkg = caller;
+    strict->import;
+    warnings->import;
 
-    no strict 'refs';
-    *{"$to\::$_"} = \&$_ for @KEYWORDS;
+    my %exports;
+
+    # we must create stubs here, as AUTOLOAD is here and doesn't (or
+    # shouldn't) inherit past a stub. They don't cause problems, as
+    # anything we inherit or implement doesn't get stubbed.
+    $exports{can} = subname "$pkg\::can", sub {
+        my ($self, $meth) = @_;
+        my $code = $self->UNIVERSAL::can($meth);
+        $code and return $code;
+        ref $self or $self = $CLASS{$self};
+        exists $self->{$meth} and return \&$meth;
+    };
+
+    # perl uses $AUTOLOAD in the package where AUTOLOAD was defined.
+    our $AUTOLOAD;
+
+    $exports{AUTOLOAD} = subname "AUTOLOAD", sub {
+        my ($pkg, $name) = $AUTOLOAD =~ /(.*)::(.*)/;
+        local $SELF = shift;
+        ref $SELF or $SELF = $CLASS{$SELF};
+        invoke $pkg, $name, @_;
+    };
+
+    {
+        no strict "refs";
+        *{"$pkg\::$_"} = $exports{$_} for keys %exports;
+
+        # we must stub everything UNIVERSAL implements, or it won't be
+        # autoloaded.
+        *{"$pkg\::$_"} = \&{"$pkg\::$_"}
+            for qw/isa DOES/;
+
+        *{"$pkg\::$_"} = \&$_ for @KEYWORDS;
+    }
 }
 
 sub unimport {
@@ -101,88 +136,89 @@ sub unimport {
 
 push @KEYWORDS, qw/self super/;
 
-our $SELF;
-sub self { $SELF }
+sub self  { $SELF }
+sub super { my $super = shift @SUPER; goto &$super; }
 
-our $SUPER;
-sub super { $SUPER->(@_) }
+# resolve a list of names out of a tree of hashes
+# returns ($entry, $title, @_)
+# $entry is undef on failure
+sub resolve {
+    my $e = self;
+    my $t;
+    local $" = "|";
+    warn "resolving [@_] for $e";
+    while (my $k = shift) {
+        $t = $t ? "$t/$k" : $k;
+        exists $e->{$k} or return (undef, $t, @_);
+        $e = $e->{$k};
+        
+        no warnings "uninitialized";
+        reftype $e eq "HASH" and
+            (not blessed $e or ismg $e)
+                or return ($e, $t, @_);
+    }
+}
 
 sub invoke;
 sub invoke {
-    my ($name, $entry, $args) = @_;
+    my $caller = shift;
+    my ($entry, $name, @args) = resolve @_;
 
-    blessed $entry and return $entry->$name(@$args);
-
-    for (reftype $entry) {
-        defined or last;
-        /CODE/              and do {
-            @_ = @$args;
-            goto &$entry;
-        };
-        /SCALAR/ || /REF/   and return $$entry;
-        /ARRAY/             and do {
-            my ($before, $meth, $after) = @$entry;
-            my ($rv, @rv);
-
-            $_->(@$args) for @$before;
-
-            wantarray
-                ? @rv = invoke $name, $meth, $args
-                : defined wantarray
-                    ? $rv = invoke $name, $meth, $args
-                    : invoke $name, $meth, $args;
-            
-            $_->(@$args) for @$after;
-
-            return wantarray
-                ? @rv : defined wantarray
-                    ? $rv : ();
-        };
-        /HASH/              and do {
-            @$args or croak "Missing argument for '$name'";
-            my $key  = shift @$args;
-            my $meth = $entry->{$key} or return;
-            @_ = ($key, $meth, $args);
-            goto &invoke;
-        };
-
+    unless (defined $entry) {
+        $name =~ m!/! and return;
+        croak "No such method $caller->$name";
     }
-    return $entry;
-}
 
-# our means that we get the correct $AUTOLOAD
-sub Object::Closures::AUTOLOAD {
-    $AUTOLOAD =~ s/.*:://;
-    local $SELF = shift;
-    exists $SELF->{$AUTOLOAD}
-        or croak "No such method '$AUTOLOAD'";
-    invoke $AUTOLOAD, $SELF->{$AUTOLOAD}, \@_;
-}
+    ref $entry or $entry = \do { my $tmp = $entry };
+ 
+    warn "$caller->$name: got " . dump $entry;
 
-my (%BUILD, %COMPOSE);
+    if (ismg $entry, "mro") {
+        local @SUPER = @$entry;
+        return super @args;
+    }
+
+    if (ismg $entry, "delegate") {
+        return $$entry->$name(@args);
+    }
+
+    my $type = reftype $entry;
+
+    if ($type eq "CODE") {
+        @_ = @args;
+        goto &$entry;
+    }
+
+    if ($type eq "HASH") {
+        croak "Missing key for $caller->$name";
+    }
+
+    # there should be nothing left but scalar refs now
+    return $$entry;
+}
 
 push @KEYWORDS, qw/build construct compose inherit with clone/;
 
-use subs qw/method replace/;
-
-# XXX
-sub construct {
-    my $class = shift;
-    local $SELF = bless {}, 'Object::Closures';
-    method isa => $class => 1;
-    method DOES => $class => 1;
-    $BUILD{$class}(@_);
-    return self;
-}
+use subs qw/method replace _get_mods _apply_mods/;
 
 sub build (&) {
     my $class = caller;
 
     $COMPOSE{$class}
         and croak "$class is already defined as a role";
-    $BUILD{$class} = shift;
+    $BUILD{$class} = subname "$class\::*BUILD*", shift;
 
     goto &unimport;
+}
+
+sub construct {
+    my $class = caller;
+    local $SELF = bless {}, $class;
+    method isa => $class => 1;
+    method DOES => $class => 1;
+    $SELF->{DESTROY} = mkmg 1, "default";
+    $BUILD{$class}(@_);
+    return self;
 }
 
 sub compose (&) {
@@ -190,111 +226,157 @@ sub compose (&) {
 
     $BUILD{$role}
         and croak "$role is already defined as a class";
-    $COMPOSE{$role} = shift;
+    $COMPOSE{$role} = subname "$role\::*COMPOSE*", shift;
 
     goto &unimport;
 }
 
 sub inherit {
     my $from = shift;
+    my @mods = _get_mods \@_;
+
+    ref $SELF or croak "inherit must be called from within build";
 
     $COMPOSE{$from}
         and croak "$from is a role, use 'with' instead of 'inherit'";
 
     method isa => $from => 1;
     $BUILD{$from} and $BUILD{$from}->(@_);
+    _apply_mods @mods;
 }
 
 sub with {
-    my ($role) = @_;
+    my $role = shift;
+    my @mods = _get_mods \@_;
+
+    ref $SELF or
+        croak "with must be called from within build or compose";
+
     replace DOES => $role => 1;
-    $COMPOSE{$role} and $COMPOSE{$role}->(@_);
+    $COMPOSE{$role} and $COMPOSE{$role}->();
+    _apply_mods @mods;
 }
 
-sub clone { self->clone(@_) }
-
-my @EDITS = qw/method replace default before after around/;
+my @EDITS = qw/method replace before after override/;
 push @KEYWORDS, @EDITS;
+
+use subs qw/_do_edit/;
 
 for my $sub (@EDITS) {
     no strict 'refs';
-    *$sub = sub {
-        use strict 'refs';
+    *$sub = subname $sub, sub { _do_edit scalar caller, $sub, @_ };
+}
 
-        my $entry = pop;
-        my $table = self 
-            or croak "No object to apply '$sub' to";
-        my $method;
+# CREATION KEYWORDS
+#
+# method        croak if exists; in a role, ignore if exists
+# replace       croak if !exists
+# around        around, croak if !exists
+# before        before, croak if !exists
+# after         after, croak if !exists
 
-        my $name  = pop;
+# CALLER, TYPE, NAME..., ENTRY
+sub _do_edit {
 
-        my $create = 
-            $sub eq 'method' ||
-            $sub eq 'default';
+    my $caller = shift;
+    my $type   = shift;
+    my $entry  = pop;
 
-        for (@_) {
-            unless (exists $table->{$_}) {
-                $create or croak $method
-                    ? "Method '$method' does not have key '$_'"
-                    : "Method '$_' is not defined";
+    my $table  = self || ($CLASS{$caller} ||= {});
+    my ($title, $name);
 
-                $table->{$_} = {};
-            }
+    my $create = $type eq "method";
+    $type eq "method" and $COMPOSE{$caller} and $type = "default";
 
-            $table = $table->{$_};
+    while (1) {
+        $name = shift;
+        $title = $title ? "$title/$name" : $name;
+        @_ or last;
 
-            reftype $table eq 'HASH'
-                or croak "Not a HASH reference";
-
-            $method ||= $_;
+        unless (exists $table->{$name}) {
+            $create or croak "Method '$title' does not exist";
+            $table->{$name} = {};
         }
 
-        my $ex = exists $table->{$name};
+        $table = $table->{$name};
 
-        my $want = 
-            $sub eq 'around' || 
-            $sub eq 'before' || 
-            $sub eq 'after';
+        reftype $table eq 'HASH'
+            or croak "Not a HASH reference";
+    }
+    Carp::cluck "$caller $type $title";
 
-        $sub eq 'method' and $ex
-            and croak $method
-                ? "Method '$method' already has a key '$name'"
-                : "Method '$name' already exists";
+    my ($orig, $stash, $mg);
 
-        $sub eq 'default' and $ex and return;
-        $sub eq 'replace' and ($ex or return);
+    if (exists $table->{$name}) {
+        $orig = $table->{$name};
+        $stash = reftype $orig eq "CODE" 
+            ? stash_name $orig
+            : undef;
 
-        if ($want) {
-            $ex or croak $method
-                ? "Method '$method' has no key '$name'"
-                : "Method '$name' not defined";
-            my $new = $entry;
-            my $old = $table->{$name};
-            
-            if ($sub eq 'around') {
-                $entry  = sub {
-                    local $SUPER = $old;
-                    invoke $name, $new, \@_;
-                };
+        if ($type eq "default") {
+
+            # you are allowed to defer resolving ambiguous defaults
+            # until construction time
+            if (ismg $orig, "default") {
+                $table->{$name} = mkmg {
+                    $stash  => $orig,
+                    $caller => $entry,
+                }, "ambiguous";
             }
-            else {
-                ref $old eq 'ARRAY' 
-                    or $old = [[], $old, []];
 
-                if ($sub eq 'before') {
-                    push @{$old->[0]}, $new;
-                }
-                elsif ($sub eq 'after') {
-                    unshift @{$old->[2]}, $new;
-                }
-                else { die "can't happen" }
-
-                $entry = $old;
+            if (ismg $orig, "ambiguous") {
+                ${$orig}{$caller} = $entry;
             }
+
+            return;
         }
 
-        $table->{$name} = $entry;
-    };
+        if ($type eq "method") {
+            croak "Method conflict with $stash->$title";
+        }
+    }
+    else {
+        $type eq "replace" and return;
+        $create or croak "Method '$title' does not exist";
+    }
+
+    # ambiguous defaults have already been dealt with, so we can just
+    # clear those magic entries
+    if (ismg $orig, "ambiguous", "default") {
+        delete $stash->{$name};
+        undef $_ for $orig, $stash, $mg;
+    }
+
+    if ($type eq "override") {
+        my @mro = ismg $orig, "mro" ? @$orig : $orig;
+        $entry = mkmg [$entry, @mro], "mro";
+    }
+    if ($type eq "default") {
+        $entry = mkmg $entry, "default";
+    }
+
+    {
+        no warnings "uninitialized";
+        reftype $entry eq "CODE" and
+            subname "$caller\::$title", $entry;
+    }
+    $table->{$name} = $entry;
+}
+
+sub _get_mods {}
+sub _apply_mods {}
+
+sub clone {
+    my ($old, $cbk) = @_;
+
+    require Clone::Closure;
+
+    # we must clone both in one operation
+    my $new = Clone::Closure::clone([$old, $cbk]);
+    ($new, $cbk) = @$new;
+
+    $cbk and $cbk->($new);
+    return $new;
 }
 
 1;
