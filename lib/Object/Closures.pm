@@ -20,6 +20,7 @@ use Scalar::Util            qw/reftype blessed/;
 use Symbol                  qw/gensym/;
 use Sub::Name               qw/subname/;
 use Sub::Identify           qw/stash_name/;
+use namespace::clean        ();
 use Data::Dump              qw/dump/;
 
 our (%BUILD, %COMPOSE, %CLASS);
@@ -69,22 +70,26 @@ sub _ctx {
 }
 
 sub invoke;
+sub construct;
+sub class;
 
 sub import {
     my $pkg = caller;
     strict->import;
     warnings->import;
 
+    # We must stub everything UNIVERSAL implements, or it won't be
+    # autoloaded. The exception is VERSION, which *should* come from
+    # UNIVERSAL.
+    my @stubs = qw/isa DOES/;
     my %exports;
 
-    # we must create stubs here, as AUTOLOAD is here and doesn't (or
-    # shouldn't) inherit past a stub. They don't cause problems, as
-    # anything we inherit or implement doesn't get stubbed.
     $exports{can} = subname "$pkg\::can", sub {
         my ($self, $meth) = @_;
+        # this should only apply to ->VERSION
         my $code = $self->UNIVERSAL::can($meth);
         $code and return $code;
-        ref $self or $self = $CLASS{$self};
+        ref $self or $self = class $self;
         exists $self->{$meth} and return \&$meth;
     };
 
@@ -94,50 +99,33 @@ sub import {
     $exports{AUTOLOAD} = subname "AUTOLOAD", sub {
         my ($pkg, $name) = $AUTOLOAD =~ /(.*)::(.*)/;
         local $SELF = shift;
-        ref $SELF or $SELF = $CLASS{$SELF};
+        warn "AUTOLOAD for $SELF";
+        ref $SELF or $SELF = class $SELF;
         invoke $pkg, $name, @_;
     };
 
     {
         no strict "refs";
-        *{"$pkg\::$_"} = $exports{$_} for keys %exports;
-
-        # we must stub everything UNIVERSAL implements, or it won't be
-        # autoloaded.
-        *{"$pkg\::$_"} = \&{"$pkg\::$_"}
-            for qw/isa DOES/;
-
-        *{"$pkg\::$_"} = \&$_ for @KEYWORDS;
+        *{"$pkg\::$_"} = $exports{$_}       for keys %exports;
+        *{"$pkg\::$_"} = \&{"$pkg\::$_"}    for @stubs;
+        *{"$pkg\::$_"} = \&$_               for @KEYWORDS;
     }
+
+    namespace::clean->import(-cleanee => $pkg, @KEYWORDS);
 }
 
-sub unimport {
-    my $from = caller;
+push @KEYWORDS, qw/self class super/;
 
-    for (@KEYWORDS) {
-        no strict 'refs';
-        no warnings 'misc';
-
-        my $old = "$from\::$_";
-
-        if (*$old{CODE} == \&$_) {
-            # we have to copy each piece individually
-            my $new = gensym;
-            *$new = *$old{SCALAR};
-            *$new = *$old{ARRAY};
-            *$new = *$old{HASH};
-            *$new = *$old{IO};
-            *$new = *$old{FORMAT};
-            delete ${"$from\::"}{$_};
-            *$old = $new;
-        }
-    }
+sub self () { $SELF }
+sub class   { 
+    my $pkg = @_ ? $_[0] : caller;
+    warn "getting class $pkg";
+    $CLASS{$pkg} ||= do {
+        package Object::Closures::Class;
+        Object::Closures::construct;
+    };
 }
-
-push @KEYWORDS, qw/self super/;
-
-sub self  { $SELF }
-sub super { my $super = shift @SUPER; goto &$super; }
+sub super   { my $super = shift @SUPER; goto &$super; }
 
 # resolve a list of names out of a tree of hashes
 # returns ($entry, $title, @_)
@@ -201,34 +189,33 @@ push @KEYWORDS, qw/build construct compose inherit with clone/;
 
 use subs qw/method replace _get_mods _apply_mods/;
 
+sub _no_dups {
+    $BUILD{$_[0]}   and croak "$_[0] is already defined as a class";
+    $COMPOSE{$_[0]} and croak "$_[0] is already defined as a role";
+}
+
 sub build (&) {
     my $class = caller;
-
-    $COMPOSE{$class}
-        and croak "$class is already defined as a role";
+    _no_dups $class;
     $BUILD{$class} = subname "$class\::*BUILD*", shift;
+}
 
-    goto &unimport;
+sub compose (&) {
+    my $role = caller;
+    _no_dups $role;
+    $COMPOSE{$role} = subname "$role\::*COMPOSE*", shift;
 }
 
 sub construct {
     my $class = caller;
     local $SELF = bless {}, $class;
-    method isa => $class => 1;
-    method DOES => $class => 1;
+    for ($class, "UNIVERSAL") {
+        method isa  => $_ => 1;
+        method DOES => $_ => 1;
+    }
     $SELF->{DESTROY} = mkmg 1, "default";
     $BUILD{$class}(@_);
     return self;
-}
-
-sub compose (&) {
-    my $role = caller;
-
-    $BUILD{$role}
-        and croak "$role is already defined as a class";
-    $COMPOSE{$role} = subname "$role\::*COMPOSE*", shift;
-
-    goto &unimport;
 }
 
 sub inherit {
@@ -282,7 +269,8 @@ sub _do_edit {
     my $type   = shift;
     my $entry  = pop;
 
-    my $table  = self || ($CLASS{$caller} ||= {});
+    my $self  = self || class $caller;
+    my $table = $self;
     my ($title, $name);
 
     my $create = $type eq "method";
@@ -303,7 +291,7 @@ sub _do_edit {
         reftype $table eq 'HASH'
             or croak "Not a HASH reference";
     }
-    Carp::cluck "$caller $type $title";
+    Carp::cluck "$type $self->$title";
 
     my ($orig, $stash, $mg);
 
@@ -378,6 +366,8 @@ sub clone {
     $cbk and $cbk->($new);
     return $new;
 }
+
+require Object::Closures::Class;
 
 1;
 
